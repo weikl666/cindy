@@ -1,0 +1,197 @@
+diff --git a/apps/desktop/src/renderer/features/plugin/MyPluginsPage.tsx b/apps/desktop/src/renderer/features/plugin/MyPluginsPage.tsx
+index 11e4929f3d..5ec82169a0 100644
+--- a/apps/desktop/src/renderer/features/plugin/MyPluginsPage.tsx
++++ b/apps/desktop/src/renderer/features/plugin/MyPluginsPage.tsx
+@@ -1,14 +1,14 @@
+ import { useConfirmDialog } from '@/components/ui/confirm-dialog-provider';
+ import { PluginPublisherBadge } from './PluginPublisherBadge';
+ import { PluginSharedUsage } from './PluginSharedUsage';
+-import { ChevronRight, Plus, RotateCw } from 'lucide-react';
++import { Building2, ChevronRight, Globe, Plus, RotateCw } from 'lucide-react';
+ import { Select } from '@/components/ui/select';
+ import { Tip } from '@/components/ui/tooltip';
+ import type { GhostPluginListItem } from './lib/ghostPluginViewModel';
+ import type { PluginMarketDetail } from '../../../shared/pluginMarket';
+ import { AccountSwitcherDialog } from '@/components/sidebar/AccountSwitcherDialog';
+ import { useSignInToCindy } from '@/hooks/useSignInToCindy';
+-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
++import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+ import { useTranslation } from 'react-i18next';
+ import { Button } from '@/components/ui/button';
+@@ -36,6 +36,10 @@ import { PluginPublishDialog, type PluginPublishDialogRequest, type PluginSubmit
+ export type { PluginSubmitOptions } from './PluginPublishDialog';
+ import { usePluginMarketForegroundRefresh } from './lib/usePluginMarketForegroundRefresh';
+ import { permissionItemDetail } from '../../../shared/ghostPermissionDetail';
++// 原型（2026-11-17）：企业插件并入「我的插件」。
++import { EnterprisePluginDetail } from './orgPrototype/EnterprisePluginDetail';
++import { OrgPublishDialog } from './orgPrototype/OrgPublishDialog';
++import { isOrgId, latestLabel, matchesFilter, orgDemo, useOrgData, type OrgPlugin } from './orgPrototype/shared';
+ 
+ const copy = 'settings.ghosts.contribution';
+ const releaseKey = (release: ContributionReleaseView) =>
+@@ -53,8 +57,21 @@ export interface MyPluginsPageCache {
+   selectedRelease?: { pluginId: string; key: string };
+ }
+ 
++type MyPluginsPageProps = Parameters<typeof PublicMyPluginsPage>[0];
++
++/** 原型：企业插件详情走独立页面，其余沿用原「我的插件」。 */
++export function MyPluginsPage(props: MyPluginsPageProps) {
++  const { t } = useTranslation();
++  const [params, setParams] = useSearchParams();
++  const selected = params.get('contribution');
++  if (isOrgId(selected)) return <EnterprisePluginDetail id={selected!} backLabel={t(`${copy}.myPlugins`)} onBack={() => {
++    const next = new URLSearchParams(params); next.delete('contribution'); setParams(next, { replace: true });
++  }} />;
++  return <PublicMyPluginsPage {...props} />;
++}
++
+ /** Kept independent of transport DTOs; the Host supplies an owner-fenced read projection. */
+-export function MyPluginsPage({
++function PublicMyPluginsPage({
+   reader,
+   localPlugins,
+   installedPluginCount,
+@@ -166,8 +183,12 @@ export function MyPluginsPage({
+   const scrollFrame = useRef<HTMLElement>(null);
+   const { scrolled, onScroll } = usePluginDetailScrolled();
+   const contributor = mode === 'cloud' && (user?.membershipKind === 'personal' || user?.membershipKind === 'org');
++  const [publishOpen, setPublishOpen] = useState(false);
++  const org = useOrgData();
+   const openPicker = () => {
+-    setPicker({ id: ++pickerSequence.current, owner: ownerKey, open: true });
++    // 原型：统一走带「发布到」的发布弹窗。
++    setPublishOpen(true);
++    void pickerSequence;
+   };
+ 
+   useEffect(() => { setPicker(null); }, [selectedId]);
+@@ -292,6 +313,7 @@ export function MyPluginsPage({
+     [reader, selectedId, query, filter, ownerKey, contributor, ownerMatches, reviewUpdates.refresh, installedRevision],
+   );
+ 
++  useEffect(() => orgDemo().subscribe(() => void refresh()), [refresh]);
+   useEffect(() => {
+     // Invalidate old requests immediately when the search changes; do not show a
+     // previous query as if it were the result of the new server-side filter.
+@@ -674,7 +696,31 @@ export function MyPluginsPage({
+     if (visibleSnapshotId && !visibleHasContent) void loadSnapshot(visibleSnapshotId);
+   }, [selectedKey, visibleSnapshotId, visibleHasContent, loadSnapshot, historyOpen]);
+   const isDetail = Boolean(selectedId);
+-  const listEmpty = page?.plugins.length === 0;
++  // 原型：个人账号没有企业发布，列表与现状一致。
++  const personal: boolean = orgDemo().personal;
++  const orgRows: OrgPlugin[] = personal ? [] : (org.plugins ?? []).filter(item => matchesFilter(item, filter, query));
++  // 原型：按去向分组，公开市场在前、企业在后（2026-11-19 用户定）；组内按更新时间。
++  const merged = [
++    ...(page ? orgRows : []).map(item => ({ kind: 'org' as const, at: item.updatedAt, item })),
++    ...(page?.plugins ?? []).map(entry => ({ kind: 'public' as const, at: entry.updatedAt ?? '', entry })),
++  ].sort((a, b) => (a.kind === b.kind ? b.at.localeCompare(a.at) : a.kind === 'public' ? -1 : 1));
++  const withGroup = (index: number, node: ReactNode) => {
++    const row = merged[index];
++    if (personal) return <Fragment key={row.kind === 'org' ? row.item.id : row.entry.pluginId}>{node}</Fragment>;
++    const first = index === 0 || merged[index - 1].kind !== row.kind;
++    const count = merged.filter(item => item.kind === row.kind).length;
++    return <Fragment key={row.kind === 'org' ? row.item.id : row.entry.pluginId}>
++      {first ? (
++        <div className="flex items-center gap-2 border-b border-[var(--border-default)] pb-2 pt-7 text-14 font-medium leading-5 text-[var(--text-primary)]">
++          {row.kind === 'org' ? <Building2 size={16} aria-hidden="true" /> : <Globe size={16} aria-hidden="true" />}
++          <span>{row.kind === 'org' ? '团队共享' : '公开市场'}</span>
++          <span className="font-normal text-[var(--text-tertiary)]">{count}</span>
++        </div>
++      ) : null}
++      {node}
++    </Fragment>;
++  };
++  const listEmpty = Boolean(page) && org.plugins !== null && merged.length === 0;
+   const rowAction = (
+     <span className="my-plugins-chevron inline-flex items-center justify-end gap-1 text-13 text-[var(--text-secondary)]">
+       {t(`${copy}.versionManagement`)}
+@@ -1146,7 +1192,8 @@ export function MyPluginsPage({
+                 ) : null}
+                 {!isDetail ? (
+                   <p className="mt-1 text-14 leading-6 text-[var(--text-tertiary)]">
+-                    {t(`${copy}.intro`)}
++                    {/* 现有文字只加「和团队共享」；个人身份原样。 */}
++                    {orgDemo().personal ? t(`${copy}.intro`) : '管理公开市场和团队共享插件的发布、更新与审核状态'}
+                   </p>
+                 ) : null}
+               </div>
+@@ -1243,7 +1290,7 @@ export function MyPluginsPage({
+                       ) : null}
+                     </div>
+                   ) : null}
+-                  {page?.plugins.length ? (
++                  {merged.length ? (
+                     <div className="my-plugins-table">
+                       <div
+                         className="my-plugins-columns border-b border-[var(--border-default)] pb-3 text-12 text-[var(--text-tertiary)]"
+@@ -1255,14 +1302,47 @@ export function MyPluginsPage({
+                         <span>{t(`${copy}.latestState`)}</span>
+                         <span />
+                       </div>
+-                      {page?.plugins.map((entry) => {
++                      {merged.map((row, index) => {
++                        if (row.kind === 'org') {
++                          const item = row.item;
++                          const local = orgDemo().localPlugins().find((l: { ghostId: string; version: string }) => l.ghostId === item.ghostId);
++                          const orgReview = reviewUpdates.updates.find(update => update.pluginId === item.id && update.unread);
++                          return withGroup(index, (
++                            <button type="button"
++                              className="my-plugins-row w-full border-b border-[var(--border-default)] py-5 text-left hover:bg-[var(--surface-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--focus-ring)]"
++                              onClick={() => openDetail(item.id)}>
++                              <span className="my-plugins-identity flex min-w-0 items-center gap-3">
++                                <GhostPluginIcon iconId={item.ghostId} iconName={item.name} />
++                                <span className="min-w-0">
++                                  <span className="block break-words text-16 font-medium leading-6 text-[var(--text-primary)]">{item.name}</span>
++                                  <span className="block break-words text-13 leading-5 text-[var(--text-tertiary)]">{/* 与公开插件一致：显示自己的名字 */}{org.members.find(m => m.id === orgDemo().meId)?.name ?? ''}</span>
++                                </span>
++                                {orgReview ? <span role="img" className="inline-flex" aria-label={t(`${copy}.unreadReview`)}><AttentionDot tone={orgReview.status === 'approved' || orgReview.status === 'enabled' ? 'done' : 'error'} /></span> : null}
++                              </span>
++                              <span className="my-plugins-local min-w-0 break-words text-13 leading-5 text-[var(--text-primary)]">
++                                <span className="my-plugins-mobile-label">{t(`${copy}.localVersion`)} ·{' '}</span>
++                                {local ? local.version : t(`${copy}.localState.missing`)}
++                              </span>
++                              <span className="my-plugins-market min-w-0 break-words text-13 leading-5 text-[var(--text-tertiary)]">
++                                <span className="my-plugins-mobile-label">{t(`${copy}.currentMarket`)} ·{' '}</span>
++                                {/* 列表里企业插件沿用这一列现有的说法 */}
++                                {!item.listedVersion ? t(`${copy}.market.not_listed`) : item.unlisted ? t(`${copy}.market.disabled`) : item.listedVersion}
++                              </span>
++                              <span className="my-plugins-latest min-w-0 break-words text-13 leading-5 text-[var(--text-primary)]">
++                                <span className="my-plugins-mobile-label">{t(`${copy}.latestState`)} ·{' '}</span>
++                                {latestLabel(item)}
++                              </span>
++                              {rowAction}
++                            </button>
++                          ));
++                        }
++                        const entry = row.entry;
+                         const local = listInstallationRead === JSON.stringify([ownerKey, installedRevision]) && navigator.onLine
+                           ? entry.localInstallation : undefined;
+                         const review = reviewUpdates.updates.find(item => item.pluginId === entry.pluginId && item.unread);
+-                        return (
++                        return withGroup(index, (
+                           <button
+                             type="button"
+-                            key={entry.pluginId}
+                             className="my-plugins-row w-full border-b border-[var(--border-default)] py-5 text-left hover:bg-[var(--surface-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--focus-ring)]"
+                             onClick={() => openDetail(entry.pluginId)}
+                           >
+@@ -1301,7 +1381,7 @@ export function MyPluginsPage({
+                             </span>
+                             {rowAction}
+                           </button>
+-                        );
++                        ));
+                       })}
+                     </div>
+                   ) : null}
+@@ -1339,6 +1419,7 @@ export function MyPluginsPage({
+           )}
+         </PluginManagementPage>
+       </main>
++      <OrgPublishDialog open={publishOpen && !selectedId} departments={org.departments} onOpenChange={setPublishOpen} />
+       {picker && contributor && ownerMatches && picker.owner === ownerKey && !selectedId ? (
+         <PluginPublishDialog
+           key={picker.id}

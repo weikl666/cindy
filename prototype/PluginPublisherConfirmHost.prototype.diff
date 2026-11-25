@@ -1,0 +1,148 @@
+diff --git a/apps/desktop/src/renderer/features/plugin/PluginPublisherConfirmHost.tsx b/apps/desktop/src/renderer/features/plugin/PluginPublisherConfirmHost.tsx
+index 915abf00b4..8d1ac3a28b 100644
+--- a/apps/desktop/src/renderer/features/plugin/PluginPublisherConfirmHost.tsx
++++ b/apps/desktop/src/renderer/features/plugin/PluginPublisherConfirmHost.tsx
+@@ -1,8 +1,12 @@
+-import { useEffect } from 'react';
++import { useEffect, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
++import { toast } from '@/lib/toast';
+ 
+-import { useConfirmDialog } from '@/components/ui/confirm-dialog-provider';
+ import { isDataOwnerPushStampCurrent } from '@/contexts/dataOwnerGeneration';
++// 原型（2026-11-17）：确认屏加入「可见成员」。原通用确认框换成专用弹窗，确认结果连同范围一起回传。
++import { PublishConfirmDialog } from './orgPrototype/PublishConfirmDialog';
++import type { OrgScope } from './orgPrototype/shared';
++import type { PrototypeVisibility } from './orgPrototype/PublishConfirmDialog';
+ 
+ interface ConfirmFacts {
+   orgSlug: string;
+@@ -17,6 +21,7 @@ interface ConfirmRequest {
+   requestId: string;
+   ownerStamp: { dataOwnerId: string; ownerGeneration: number };
+   facts: ConfirmFacts;
++  prototypeVisibility?: PrototypeVisibility;
+ }
+ 
+ function isConfirmRequest(value: unknown): value is ConfirmRequest {
+@@ -41,72 +46,72 @@ function formatBytes(sizeBytes: number): string {
+   return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
+ }
+ 
++// 原型保险：真实 Host（AI 对话发布）发来的确认请求，无论用户点什么都按「取消」回传，绝不触发真实上传。
++// 用方括号取值，避开本地 vite 体验数据注入的文本替换，拿到真实 IPC。
++// eslint-disable-next-line @typescript-eslint/no-explicit-any
++const realPublisher = (window as any)['electronAPI']['pluginPublisher'];
++
+ export function PluginPublisherConfirmHost() {
+   const { t } = useTranslation();
+-  const { confirm } = useConfirmDialog();
++  const [current, setCurrent] = useState<{
++    raw: ConfirmRequest; settle: (result: { confirmed: boolean; scope?: OrgScope }) => void;
++  } | null>(null);
+ 
+   useEffect(() => {
+-    return window.electronAPI.pluginPublisher.onConfirm((raw) => {
++    const listen = (source: 'real' | 'demo', api: typeof realPublisher) => api.onConfirm((raw: unknown) => {
+       if (!isConfirmRequest(raw)) return;
+       void (async () => {
+-        let confirmed = false;
++        let result: { confirmed: boolean; scope?: OrgScope } = { confirmed: false };
+         let unsubscribeAuth: () => void = () => undefined;
+         try {
+           if (!isDataOwnerPushStampCurrent(raw.ownerStamp)) return;
+-          const abort = new AbortController();
+-          unsubscribeAuth = window.electronAPI.onAuthStateChange((state) => {
+-            if (
+-              state.dataOwnerId !== raw.ownerStamp.dataOwnerId ||
+-              state.ownerGeneration !== raw.ownerStamp.ownerGeneration
+-            ) {
+-              abort.abort();
+-            }
++          result = await new Promise((settle) => {
++            unsubscribeAuth = window.electronAPI.onAuthStateChange((state) => {
++              if (
++                state.dataOwnerId !== raw.ownerStamp.dataOwnerId ||
++                state.ownerGeneration !== raw.ownerStamp.ownerGeneration
++              ) settle({ confirmed: false });
++            });
++            setCurrent({ raw, settle });
+           });
+-          if (!isDataOwnerPushStampCurrent(raw.ownerStamp)) abort.abort();
+-          confirmed = await confirm(
+-            {
+-              title: t('settings.ghosts.publish.confirmTitle', { name: raw.facts.name }),
+-              description: t('settings.ghosts.publish.confirmDescription'),
+-              content: (
+-                <dl className="space-y-2 text-13 text-[var(--text-secondary)]">
+-                  <div className="flex justify-between gap-4">
+-                    <dt>{t('settings.ghosts.publish.org')}</dt>
+-                    <dd className="text-[var(--text-primary)]">
+-                      {raw.facts.orgName ?? raw.facts.orgSlug}
+-                    </dd>
+-                  </div>
+-                  <div className="flex justify-between gap-4">
+-                    <dt>{t('settings.ghosts.publish.pluginId')}</dt>
+-                    <dd className="text-[var(--text-primary)]">{raw.facts.ghostId}</dd>
+-                  </div>
+-                  <div className="flex justify-between gap-4">
+-                    <dt>{t('settings.ghosts.publish.version')}</dt>
+-                    <dd className="text-[var(--text-primary)]">{raw.facts.version}</dd>
+-                  </div>
+-                  <div className="flex justify-between gap-4">
+-                    <dt>{t('settings.ghosts.publish.size')}</dt>
+-                    <dd className="text-[var(--text-primary)]">{formatBytes(raw.facts.sizeBytes)}</dd>
+-                  </div>
+-                </dl>
+-              ),
+-              maxWidth: 480,
+-              confirmText: t('settings.ghosts.publish.confirm'),
+-              cancelText: t('settings.ghosts.publish.cancel'),
+-              autoFocusConfirm: true,
+-            },
+-            abort.signal,
+-          );
+         } finally {
+           unsubscribeAuth();
++          setCurrent((value) => (value?.raw.requestId === raw.requestId ? null : value));
+           try {
+-            await window.electronAPI.pluginPublisher.resolveConfirm(raw.requestId, confirmed);
++            if (source === 'real') {
++              await api.resolveConfirm(raw.requestId, false);
++              if (result.confirmed) toast.info('原型演示：已记录你选的可见范围，没有真的上传', { duration: 4000 });
++            } else {
++              await api.resolveConfirm(raw.requestId, result.confirmed, result.scope);
++            }
+           } catch {
+             // Window teardown cancels the pending confirm in Main.
+           }
+         }
+       })();
+     });
+-  }, [confirm, t]);
++    const offReal = listen('real', realPublisher);
++    const offDemo = window.electronAPI.pluginPublisher === realPublisher ? () => undefined : listen('demo', window.electronAPI.pluginPublisher);
++    return () => { offReal?.(); offDemo?.(); };
++  }, []);
+ 
+-  return null;
++  if (!current) return null;
++  const { raw, settle } = current;
++  return (
++    <PublishConfirmDialog
++      key={raw.requestId}
++      facts={{ ...raw.facts, size: formatBytes(raw.facts.sizeBytes) }}
++      labels={{
++        title: t('settings.ghosts.publish.confirmTitle', { name: raw.facts.name }),
++        org: t('settings.ghosts.publish.org'),
++        pluginId: t('settings.ghosts.publish.pluginId'),
++        version: t('settings.ghosts.publish.version'),
++        size: t('settings.ghosts.publish.size'),
++        confirm: t('settings.ghosts.publish.confirm'),
++        cancel: t('settings.ghosts.publish.cancel'),
++      }}
++      onSettle={settle}
++      visibility={raw.prototypeVisibility}
++    />
++  );
+ }
