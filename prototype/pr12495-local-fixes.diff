@@ -1,0 +1,474 @@
+diff --git a/apps/desktop/src/renderer/features/plugin/GhostPluginPage.tsx b/apps/desktop/src/renderer/features/plugin/GhostPluginPage.tsx
+index 68a2131c..4238de9f 100644
+--- a/apps/desktop/src/renderer/features/plugin/GhostPluginPage.tsx
++++ b/apps/desktop/src/renderer/features/plugin/GhostPluginPage.tsx
+@@ -8,6 +8,7 @@ import { rememberContributionIntent, consumeContributionIntent, matchesContribut
+ import { MyPluginsPage, contributionErrorKey, type MyPluginsPageCache, type PluginSubmitOptions } from './MyPluginsPage';
+ import { localPublishingUnavailableKey, teamPublishingUnavailableKey } from './lib/ghostPluginDetailModel';
+ import { PluginPublishDialog, type PluginPublishDialogRequest } from './PluginPublishDialog';
++import { useTeamPlugins } from './team/useTeamPlugins';
+ import { featureRetirementById, type FeatureRetirement } from '../../../shared/featureRetirements';
+ import { RetiredFeatureDetail } from './RetiredFeatureDetail';
+ import { Button } from '@/components/ui/button';
+@@ -947,6 +948,10 @@ function LocalPluginCatalogSource({
+     plugins: teamPublishableInstalledItems,
+     onStart: startTeamPublish,
+   } : undefined, [showEnterprise, user?.orgName, user?.orgSlug, teamPublishableInstalledItems, startTeamPublish]);
++  // The plugin detail's 「发布插件」 marks team plugins under review or with a used version, like the
++  // 「发布插件」 page: read the member's team plugins while that dialog is open.
++  const detailTeamPlugins = useTeamPlugins(Boolean(teamPublishing) && Boolean(publicationDialog?.open),
++    contributionOwner, publicationDialog?.id ?? 0);
+   const searchedInstalledItems = useMemo(
+     () => filterGhostPluginItems(installedItems, query),
+     [installedItems, query],
+@@ -2063,6 +2068,9 @@ function LocalPluginCatalogSource({
+       open={publicationDialog.open}
+       ownerKey={contributionOwner}
+       initialInstanceId={publicationDialog.instanceId}
++      team={teamPublishing}
++      initialTarget="team"
++      teamPlugins={detailTeamPlugins.status === 'ready' ? detailTeamPlugins.plugins : null}
+       reader={window.electronAPI.pluginContributions}
+       localPlugins={publishableInstalledItems}
+       installedPluginCount={allInstalledItems.length}
+diff --git a/apps/desktop/src/renderer/features/plugin/PluginPublishDialog.tsx b/apps/desktop/src/renderer/features/plugin/PluginPublishDialog.tsx
+index 51ae0df9..bbb494fa 100644
+--- a/apps/desktop/src/renderer/features/plugin/PluginPublishDialog.tsx
++++ b/apps/desktop/src/renderer/features/plugin/PluginPublishDialog.tsx
+@@ -45,7 +45,7 @@ export interface PluginPublishDialogRequest {
+ export function PluginPublishDialog({
+   open, ownerKey, initialInstanceId, onOpenChange, onClosed,
+   reader, localPlugins, installedPluginCount, onPrepare, onSubmitUpdate, sourceDevice,
+-  submitBusy = false, installedRevision, submissionRevision = 0, team, teamPlugins = null,
++  submitBusy = false, installedRevision, submissionRevision = 0, team, teamPlugins = null, initialTarget,
+ }: {
+   open: boolean;
+   ownerKey: string;
+@@ -70,15 +70,22 @@ export function PluginPublishDialog({
+    * is still refused at upload (PLUGIN_PENDING_RELEASE_EXISTS).
+    */
+   teamPlugins?: readonly PersonalPluginSummary[] | null;
++  /**
++   * Target to start on when opened for one plugin (`initialInstanceId`). The plugin detail's
++   * 「发布插件」 starts on team sharing for organization members, with that plugin selected.
++   */
++  initialTarget?: PublishTarget;
+ }) {
+   const { t, i18n } = useTranslation();
+   const location = useLocation();
+   const pickerStatusId = useId();
+   const [pickerSelection, setPickerSelection] = useState<string | null>(initialInstanceId ?? null);
+-  // Organization members start on team sharing (product prototype); the quick "submit for review"
+-  // entry from a public plugin is public.
+-  const [target, setTarget] = useState<PublishTarget>(team && !initialInstanceId ? 'team' : 'public');
+-  const [teamSelection, setTeamSelection] = useState<string | null>(null);
++  // Organization members start on team sharing (product prototype), including the plugin detail's
++  // 「发布插件」 with that plugin selected; the quick "submit for review" entry from a public plugin is public.
++  const [target, setTarget] = useState<PublishTarget>(
++    team ? (initialTarget ?? (initialInstanceId ? 'public' : 'team')) : 'public');
++  const [teamSelection, setTeamSelection] = useState<string | null>(
++    team && initialInstanceId && team.plugins.some(item => item.id === initialInstanceId) ? initialInstanceId : null);
+   const [teamStarting, setTeamStarting] = useState(false);
+   const [teamFailed, setTeamFailed] = useState(false);
+   const publicTarget = target === 'public';
+@@ -178,17 +185,23 @@ export function PluginPublishDialog({
+ 
+   // Same pending rule as the team list and detail: a plugin with a version under review takes no
+   // new upload. The prototype reads 「这个版本正在审核」; another version under review is named.
+-  const teamReviewing = (local: GhostPluginListItem) => {
++  // A version already submitted (approved, returned or cancelled) cannot be reused either; it is
++  // marked up front with the public market's wording instead of failing after the confirm screen.
++  const teamUnavailable = (local: GhostPluginListItem) => {
+     const published = teamPlugins?.find(plugin => plugin.ghostId === local.ghostId);
+-    const release = published ? teamPendingRelease(published) : null;
+-    if (!release) return null;
+-    return {
+-      key: `${copy}.unavailable.${release.version === local.version ? 'teamReviewing' : 'teamOtherReviewing'}`,
+-      version: release.version,
+-    };
++    if (!published) return null;
++    const release = teamPendingRelease(published);
++    if (release) {
++      return {
++        key: `${copy}.unavailable.${release.version === local.version ? 'teamReviewing' : 'teamOtherReviewing'}`,
++        version: release.version,
++      };
++    }
++    const used = [published.latestRelease, published.currentRelease].some(item => item?.version === local.version);
++    return used ? { key: `${copy}.errors.VERSION_ALREADY_SUBMITTED`, version: local.version } : null;
+   };
+   const teamItemCandidate = team?.plugins.find(item => item.id === teamSelection);
+-  const teamItem = teamItemCandidate && !teamReviewing(teamItemCandidate) ? teamItemCandidate : undefined;
++  const teamItem = teamItemCandidate && !teamUnavailable(teamItemCandidate) ? teamItemCandidate : undefined;
+   const startTeam = () => {
+     if (!team || !teamItem || teamStarting) return;
+     const token = pickerContext.current.token;
+@@ -280,7 +293,7 @@ export function PluginPublishDialog({
+               {team ? <h3 className="mb-1 text-13 leading-[1.5385] text-[var(--confirm-desc)]">{t(`${copy}.pluginList`)}</h3> : null}
+               {target === 'team' && team ? <>
+                 {team.plugins.map(local => {
+-                  const reviewing = teamReviewing(local);
++                  const reviewing = teamUnavailable(local);
+                   return pluginRow(local, {
+                     selected: teamItem?.id === local.id,
+                     disabled: !open || teamStarting || Boolean(reviewing),
+diff --git a/apps/desktop/src/renderer/features/plugin/__tests__/GhostPluginPage.navigation.test.tsx b/apps/desktop/src/renderer/features/plugin/__tests__/GhostPluginPage.navigation.test.tsx
+index b072a156..15b92739 100644
+--- a/apps/desktop/src/renderer/features/plugin/__tests__/GhostPluginPage.navigation.test.tsx
++++ b/apps/desktop/src/renderer/features/plugin/__tests__/GhostPluginPage.navigation.test.tsx
+@@ -2554,9 +2554,18 @@ describe('plugin use details and independent author management', () => {
+     let finishPreview!: (value: ContributionTransferView['prepared']) => void;
+     api.prepare.mockImplementation(() => new Promise<ContributionTransferView['prepared']>(resolve => { finishPreview = resolve; }));
+     Object.assign(window.electronAPI, { pluginContributions: { ...api, discard: vi.fn().mockResolvedValue(undefined) } });
++    // The detail's team target reads the member's team plugins to mark ones under review or with a used version.
++    if (membershipKind === 'org') Object.assign(window.electronAPI, { pluginAuthor: { listPlugins: vi.fn().mockResolvedValue({ plugins: [], nextCursor: null }) } });
+     render(page(`/plugins?ghost=${installed.instanceKey}`));
+     expect(api.prepare).not.toHaveBeenCalled();
+     const picker = await openLocalPublishing();
++    if (membershipKind === 'org') {
++      // Organization members start on team sharing from the plugin detail; the public update is a manual switch.
++      const team = within(picker).getByRole('radio', { name: new RegExp(`${prefix}.target.team`) });
++      expect(team.getAttribute('aria-checked')).toBe('true');
++      expect(api.prepare).not.toHaveBeenCalled();
++      fireEvent.click(within(picker).getByRole('radio', { name: new RegExp(`${prefix}.target.public`) }));
++    }
+     await waitFor(() => expect(api.prepare).toHaveBeenCalledTimes(1));
+     expect(within(picker).queryByRole('button', { name: `${prefix}.submitVersion` })).toBeNull();
+     expect(api.submit).not.toHaveBeenCalled();
+diff --git a/apps/desktop/src/renderer/features/plugin/__tests__/MyPluginsPage.test.tsx b/apps/desktop/src/renderer/features/plugin/__tests__/MyPluginsPage.test.tsx
+index 366f197b..6d538a86 100644
+--- a/apps/desktop/src/renderer/features/plugin/__tests__/MyPluginsPage.test.tsx
++++ b/apps/desktop/src/renderer/features/plugin/__tests__/MyPluginsPage.test.tsx
+@@ -463,6 +463,8 @@ describe('My Plugins facts', () => {
+       { id: 'team-3', ghostId: 'acme.weekly', name: 'Weekly Report', myRole: 'creator', status: 'active',
+         currentRelease: { id: 'r4', version: '1.2.0', reviewStatus: 'approved' },
+         latestRelease: { id: 'r5', version: '1.3.0', reviewStatus: 'rejected' }, pendingRelease: null },
++      { id: 'team-4', ghostId: 'acme.crm', name: 'CRM Sync', myRole: 'creator', status: 'disabled',
++        currentRelease: null, latestRelease: { id: 'r6', version: '0.2.1', reviewStatus: 'rejected' }, pendingRelease: null },
+     ] }));
+     Object.assign(window, { electronAPI: { pluginAuthor: { listPlugins, plugin: vi.fn(), maintainers: vi.fn(async () => []),
+       releases: vi.fn(async () => ({ nextCursor: null, releases: [] })) } } });
+@@ -473,6 +475,7 @@ describe('My Plugins facts', () => {
+         { id: 'expense-instance', ghostId: 'acme.expense', name: 'Expense Check', version: '0.3.0' },
+         { id: 'router-instance', ghostId: 'acme.router', name: 'Ticket Router', version: '1.2.0' },
+         { id: 'weekly-instance', ghostId: 'acme.weekly', name: 'Weekly Report', version: '1.4.0' },
++        { id: 'crm-instance', ghostId: 'acme.crm', name: 'CRM Sync', version: '0.2.1' },
+       ] as GhostPluginListItem[],
+       onStart,
+     };
+@@ -493,6 +496,10 @@ describe('My Plugins facts', () => {
+       // A returned version is not under review: that plugin can be published.
+       const weekly = within(picker).getByRole('button', { name: 'Weekly Report · 1.4.0 · weekly-instance' });
+       expect(weekly).toHaveProperty('disabled', false);
++      // A version already submitted (here returned) cannot be reused: marked up front like the public market.
++      const crm = within(picker).getByRole('button', { name: 'CRM Sync · 0.2.1 · crm-instance' });
++      expect(crm).toHaveProperty('disabled', true);
++      expect(within(crm).getByText(`${prefix}.errors.VERSION_ALREADY_SUBMITTED 0.2.1`)).toBeTruthy();
+       fireEvent.click(expense);
+       expect(within(picker).getByRole('button', { name: `${prefix}.next` })).toHaveProperty('disabled', true);
+       fireEvent.click(weekly);
+diff --git a/apps/desktop/src/renderer/features/plugin/__tests__/PluginPublisherConfirmHost.test.tsx b/apps/desktop/src/renderer/features/plugin/__tests__/PluginPublisherConfirmHost.test.tsx
+index 836d8ae6..b905421b 100644
+--- a/apps/desktop/src/renderer/features/plugin/__tests__/PluginPublisherConfirmHost.test.tsx
++++ b/apps/desktop/src/renderer/features/plugin/__tests__/PluginPublisherConfirmHost.test.tsx
+@@ -132,6 +132,9 @@ describe('PluginPublisherConfirmHost', () => {
+     expect((within(dialog).getByRole('radio', { name: `${audience}.all` }) as HTMLInputElement).checked).toBe(true);
+     fireEvent.click(within(dialog).getByRole('radio', { name: `${audience}.specified` }));
+     const picker = await screen.findByRole('dialog', { name: `${audience}.picker.title` });
++    // The choice only switches when the picker confirms: no empty-selection error behind the opening picker.
++    expect(within(dialog).queryByText(`${audience}.requireOne`)).toBeNull();
++    expect((within(dialog).getByRole('radio', { name: `${audience}.specified`, hidden: true }) as HTMLInputElement).checked).toBe(false);
+     fireEvent.click(within(picker).getByRole('button', { name: `${audience}.picker.cancel` }));
+     await waitFor(() => expect(screen.queryByRole('dialog', { name: `${audience}.picker.title` })).toBeNull());
+     expect((within(dialog).getByRole('radio', { name: `${audience}.all` }) as HTMLInputElement).checked).toBe(true);
+diff --git a/apps/desktop/src/renderer/features/plugin/__tests__/TeamPluginDetail.test.tsx b/apps/desktop/src/renderer/features/plugin/__tests__/TeamPluginDetail.test.tsx
+index c73f5b1d..e66989e3 100644
+--- a/apps/desktop/src/renderer/features/plugin/__tests__/TeamPluginDetail.test.tsx
++++ b/apps/desktop/src/renderer/features/plugin/__tests__/TeamPluginDetail.test.tsx
+@@ -375,6 +375,33 @@ describe('TeamPluginDetail', () => {
+   // Release history starts expanded (product prototype) and shows, per version, the submit time,
+   // review outcome, decision time and the return reason; versions from older servers (no review
+   // field) only show what is known.
++  // Product prototype: the local version reads like the publish dialog's rows, not the upload error.
++  it('says why the local version cannot be submitted in the words of the publish dialog', async () => {
++    const local = (version: string) => [{ id: 'i1', ghostId: 'meeting-notes', name: 'Meeting Notes', version }] as never;
++    const pending = plugin({ pendingRelease: { id: 'r2', version: '1.1.0', reviewStatus: 'pending', publishedAt: '2026-11-20T00:00:00.000Z' } });
++    const show = (detail: PersonalPluginDetail, version: string) => {
++      cleanup();
++      api.plugin.mockResolvedValue(detail);
++      render(<TeamPluginDetail pluginId="p1" memberId="m-li" orgName="Acme" localPlugins={local(version)} onStartPublish={vi.fn(async () => true)} />);
++    };
++    show(pending, '1.1.0');
++    expect(await screen.findByText(`${copy}.unavailable.teamReviewing 1.1.0`)).toBeTruthy();
++    expect(screen.queryByText(`${copy}.errors.PLUGIN_PENDING_RELEASE_EXISTS`)).toBeNull();
++    show(pending, '1.2.0');
++    expect(await screen.findByText(`${copy}.unavailable.teamOtherReviewing 1.1.0`)).toBeTruthy();
++    show(plugin(), '1.0.0');
++    expect(await screen.findByText(`${copy}.errors.VERSION_ALREADY_SUBMITTED 1.0.0`)).toBeTruthy();
++  });
++
++  it('marks a failed upload in the history', async () => {
++    api.releases.mockResolvedValueOnce({ nextCursor: null, releases: [
++      { id: 'r0', version: '0.9.0', reviewStatus: null, status: 'failed', createdAt: '2026-11-02T00:00:00.000Z', review: null },
++    ] });
++    mount(plugin());
++    const history = await screen.findByRole('list', { name: `${copy}.history` });
++    expect(within(history).getByText(`${copy}.review.failed`)).toBeTruthy();
++  });
++
+   it('shows each version with its review result in the expanded history', async () => {
+     api.releases.mockResolvedValueOnce({ nextCursor: 'c2', releases: [
+       { id: 'r3', version: '1.2.0', reviewStatus: 'rejected', publishedAt: '2026-11-18T00:00:00.000Z',
+diff --git a/apps/desktop/src/renderer/features/plugin/audience/AudienceEditor.tsx b/apps/desktop/src/renderer/features/plugin/audience/AudienceEditor.tsx
+index 41f56ad8..784cf769 100644
+--- a/apps/desktop/src/renderer/features/plugin/audience/AudienceEditor.tsx
++++ b/apps/desktop/src/renderer/features/plugin/audience/AudienceEditor.tsx
+@@ -59,14 +59,14 @@ export function AudienceEditor({
+   const empty = draftItemCount(draft) === 0;
+   const choose = (mode: AudienceDraft['mode']) => {
+     if (mode === draft.mode) return;
++    // Nothing chosen yet: only open the picker. The choice switches when the picker confirms, so the
++    // empty-selection error never flashes behind the opening picker and cancelling changes nothing.
++    if (mode === 'matchAny' && empty) { setPicker({ revertToAll: true }); return; }
+     onChange({ ...draft, mode });
+-    if (mode === 'matchAny' && empty) setPicker({ revertToAll: true });
+   };
+   const closePicker = (next?: AudienceDraft) => {
+-    const revert = picker?.revertToAll;
+     setPicker(null);
+     if (next) onChange(next);
+-    else if (revert && empty) onChange({ ...draft, mode: 'all' });
+   };
+ 
+   return (
+diff --git a/apps/desktop/src/renderer/features/plugin/team/TeamPluginDetail.tsx b/apps/desktop/src/renderer/features/plugin/team/TeamPluginDetail.tsx
+index 75d858aa..a63c4dc5 100644
+--- a/apps/desktop/src/renderer/features/plugin/team/TeamPluginDetail.tsx
++++ b/apps/desktop/src/renderer/features/plugin/team/TeamPluginDetail.tsx
+@@ -331,10 +331,11 @@ export function TeamPluginDetail({
+   const listing = teamListingActions(detail);
+   const isCreator = detail.myRole === 'creator';
+   const current = detail.currentRelease ?? null;
++  // Same wording as the publish dialog's rows: 「这个版本正在审核」 / 「1.2.0 正在审核」 / 「该版本已经提审…」.
+   const localBlocker = localPlugin
+-    ? pending ? 'PLUGIN_PENDING_RELEASE_EXISTS'
++    ? pending ? { key: `unavailable.${pending.version === localPlugin.version ? 'teamReviewing' : 'teamOtherReviewing'}`, version: pending.version }
+       : detail.latestRelease?.version === localPlugin.version || current?.version === localPlugin.version
+-        ? 'VERSION_ALREADY_SUBMITTED' : null
++        ? { key: 'errors.VERSION_ALREADY_SUBMITTED', version: localPlugin.version } : null
+     : null;
+ 
+   // 当前提审 shows the latest submission like the public detail, whatever its result: its version
+@@ -457,7 +458,7 @@ export function TeamPluginDetail({
+             ) : null}
+           </div>
+           {localPlugin && localBlocker ? (
+-            <p role="status" className="text-12 leading-[1.667] text-[var(--text-tertiary)]">{t(`${copy}.errors.${localBlocker}`)}</p>
++            <p role="status" className="text-12 leading-[1.667] text-[var(--text-tertiary)]">{t(`${copy}.${localBlocker.key}`, { version: localBlocker.version })}</p>
+           ) : null}
+         </section>
+         <section aria-label={t(`${audienceCopy}.title`)} className={sectionClass}>
+@@ -570,7 +571,7 @@ export function TeamPluginDetail({
+               <ol aria-label={t(`${copy}.history`)} className="space-y-3">
+                 {history.releases.map((release) => {
+                   const outcome = release.review?.outcome
+-                    ?? (release.reviewStatus === 'pending' ? 'pending' : null);
++                    ?? (release.reviewStatus === 'pending' ? 'pending' : release.status === 'failed' ? 'failed' : null);
+                   const reason = release.review?.outcome === 'rejected' ? release.review.reason?.trim() : null;
+                   // The listed version reads 「已上架」 / 「已下架」, as in 当前提审 and the list.
+                   const listedKey = release.id === current?.id && (outcome === 'approved' || release.reviewStatus === 'approved')
+diff --git a/apps/desktop/src/renderer/i18n/locales/de/common.json b/apps/desktop/src/renderer/i18n/locales/de/common.json
+index 07c1a23a..756bd78f 100644
+--- a/apps/desktop/src/renderer/i18n/locales/de/common.json
++++ b/apps/desktop/src/renderer/i18n/locales/de/common.json
+@@ -9435,7 +9435,8 @@
+           "superseded": "Durch eine spätere Einreichung ersetzt",
+           "legacy_unverified": "Frühere Revision nicht verfügbar",
+           "current": "Ergebnis unbestätigt",
+-          "cancelled": "Abgebrochen"
++          "cancelled": "Abgebrochen",
++          "failed": "Upload fehlgeschlagen"
+         },
+         "reason": "Grund",
+         "rejectionReason": "Ablehnungsgrund",
+diff --git a/apps/desktop/src/renderer/i18n/locales/en/common.json b/apps/desktop/src/renderer/i18n/locales/en/common.json
+index 813f5fb2..0121acf7 100644
+--- a/apps/desktop/src/renderer/i18n/locales/en/common.json
++++ b/apps/desktop/src/renderer/i18n/locales/en/common.json
+@@ -9435,7 +9435,8 @@
+           "superseded": "Replaced by a Later Submission",
+           "legacy_unverified": "Historical revision unavailable",
+           "current": "Result Unconfirmed",
+-          "cancelled": "Cancelled"
++          "cancelled": "Cancelled",
++          "failed": "Upload failed"
+         },
+         "reason": "Reason",
+         "rejectionReason": "Rejection reason",
+diff --git a/apps/desktop/src/renderer/i18n/locales/es/common.json b/apps/desktop/src/renderer/i18n/locales/es/common.json
+index fb53886d..06b7839d 100644
+--- a/apps/desktop/src/renderer/i18n/locales/es/common.json
++++ b/apps/desktop/src/renderer/i18n/locales/es/common.json
+@@ -9510,7 +9510,8 @@
+           "superseded": "Reemplazado por un envío posterior",
+           "legacy_unverified": "Revisión histórica no disponible",
+           "current": "Resultado sin confirmar",
+-          "cancelled": "Cancelado"
++          "cancelled": "Cancelado",
++          "failed": "Error al subir"
+         },
+         "reason": "Motivo",
+         "rejectionReason": "Motivo del rechazo",
+diff --git a/apps/desktop/src/renderer/i18n/locales/fr/common.json b/apps/desktop/src/renderer/i18n/locales/fr/common.json
+index ca998d04..a1268b13 100644
+--- a/apps/desktop/src/renderer/i18n/locales/fr/common.json
++++ b/apps/desktop/src/renderer/i18n/locales/fr/common.json
+@@ -9510,7 +9510,8 @@
+           "superseded": "Remplacé par une soumission ultérieure",
+           "legacy_unverified": "Révision historique indisponible",
+           "current": "Résultat non confirmé",
+-          "cancelled": "Annulé"
++          "cancelled": "Annulé",
++          "failed": "Échec de l’envoi"
+         },
+         "reason": "Motif",
+         "rejectionReason": "Motif du rejet",
+diff --git a/apps/desktop/src/renderer/i18n/locales/ja/common.json b/apps/desktop/src/renderer/i18n/locales/ja/common.json
+index 20ae4d46..cdc84dbe 100644
+--- a/apps/desktop/src/renderer/i18n/locales/ja/common.json
++++ b/apps/desktop/src/renderer/i18n/locales/ja/common.json
+@@ -9391,7 +9391,8 @@
+           "superseded": "後の提出に置き換え済み",
+           "legacy_unverified": "過去の改訂を確認できません",
+           "current": "結果未確認",
+-          "cancelled": "取り消し済み"
++          "cancelled": "取り消し済み",
++          "failed": "アップロード失敗"
+         },
+         "reason": "理由",
+         "rejectionReason": "却下理由",
+diff --git a/apps/desktop/src/renderer/i18n/locales/ko/common.json b/apps/desktop/src/renderer/i18n/locales/ko/common.json
+index 7cdf9fd4..5ef1928b 100644
+--- a/apps/desktop/src/renderer/i18n/locales/ko/common.json
++++ b/apps/desktop/src/renderer/i18n/locales/ko/common.json
+@@ -9391,7 +9391,8 @@
+           "superseded": "이후 제출로 대체됨",
+           "legacy_unverified": "과거 수정본 확인 불가",
+           "current": "처리 결과 미확인",
+-          "cancelled": "취소됨"
++          "cancelled": "취소됨",
++          "failed": "업로드 실패"
+         },
+         "reason": "처리 사유",
+         "rejectionReason": "반려 사유",
+diff --git a/apps/desktop/src/renderer/i18n/locales/pt-BR/common.json b/apps/desktop/src/renderer/i18n/locales/pt-BR/common.json
+index 5c898e50..a0399eda 100644
+--- a/apps/desktop/src/renderer/i18n/locales/pt-BR/common.json
++++ b/apps/desktop/src/renderer/i18n/locales/pt-BR/common.json
+@@ -9510,7 +9510,8 @@
+           "superseded": "Substituído por um envio posterior",
+           "legacy_unverified": "Revisão histórica indisponível",
+           "current": "Resultado não confirmado",
+-          "cancelled": "Cancelado"
++          "cancelled": "Cancelado",
++          "failed": "Falha no envio"
+         },
+         "reason": "Motivo",
+         "rejectionReason": "Motivo da rejeição",
+diff --git a/apps/desktop/src/renderer/i18n/locales/pt-PT/common.json b/apps/desktop/src/renderer/i18n/locales/pt-PT/common.json
+index a7530a1c..16615443 100644
+--- a/apps/desktop/src/renderer/i18n/locales/pt-PT/common.json
++++ b/apps/desktop/src/renderer/i18n/locales/pt-PT/common.json
+@@ -9510,7 +9510,8 @@
+           "superseded": "Substituído por uma submissão posterior",
+           "legacy_unverified": "Revisão histórica indisponível",
+           "current": "Resultado não confirmado",
+-          "cancelled": "Cancelado"
++          "cancelled": "Cancelado",
++          "failed": "Falha no envio"
+         },
+         "reason": "Motivo",
+         "rejectionReason": "Motivo da rejeição",
+diff --git a/apps/desktop/src/renderer/i18n/locales/zh-CN/common.json b/apps/desktop/src/renderer/i18n/locales/zh-CN/common.json
+index 1783d899..27bcc438 100644
+--- a/apps/desktop/src/renderer/i18n/locales/zh-CN/common.json
++++ b/apps/desktop/src/renderer/i18n/locales/zh-CN/common.json
+@@ -9220,7 +9220,7 @@
+           "title": "无法发布这个插件",
+           "forbidden": "本企业未开启成员发布，或你没有发布权限。可以联系管理员。",
+           "archived": "这个插件已归档，不能再发布新版本。",
+-          "commonManaged": "这个插件由平台通用插件生成，企业不能为它发布版本。",
++          "commonManaged": "这个插件由管理员统一管理，不能在这里发布或修改。",
+           "repositoryManaged": "这个插件由代码仓库发布管理，请通过仓库发布新版本。"
+         },
+         "progress": {
+@@ -9232,7 +9232,7 @@
+           "published": "{{name}} {{version}} 已发布",
+           "failed": "{{name}} 发布失败，请稍后重试",
+           "networkUnreachable": "{{name}} 发布失败：网络无法连接，可以重试",
+-          "versionExists": "{{name}} {{version}} 这个版本号已用过，请修改版本号后重新发布",
++          "versionExists": "{{name}} {{version}}：该版本已经提审，请更改版本号并安装更新后重新提交审核。",
+           "notAllowed": "{{name}} 未发布：这个插件当前不能发布",
+           "expired": "{{name}} 上传已过期，请重新发布"
+         }
+@@ -9391,7 +9391,8 @@
+           "superseded": "已被后续提交替代",
+           "legacy_unverified": "历史修订无法核实",
+           "current": "处理结果尚未确认",
+-          "cancelled": "已取消"
++          "cancelled": "已取消",
++          "failed": "上传失败"
+         },
+         "reason": "处理原因",
+         "rejectionReason": "驳回原因",
+@@ -9475,7 +9476,7 @@
+           "PLUGIN_AUDIENCE_VALIDATION_UNAVAILABLE": "暂时无法核对可见范围，请稍后重试。",
+           "PLUGIN_MEMBER_LOOKUP_UNAVAILABLE": "暂时无法核对成员身份，请稍后重试。",
+           "PLUGIN_MAINTAINER_EXISTS": "此成员已经是维护者。",
+-          "COMMON_PLUGIN_MANAGED": "这个插件由管理员统一管理，不能在这里修改。"
++          "COMMON_PLUGIN_MANAGED": "这个插件由管理员统一管理，不能在这里发布或修改。"
+         },
+         "installForAccount": "无法找到原来选择的插件安装。请在当前账号下重新选择插件，核对后再提交审核。",
+         "releaseSha": "实际版本包 SHA-256",
+diff --git a/apps/desktop/src/renderer/i18n/locales/zh-Hans-x-lzh/common.json b/apps/desktop/src/renderer/i18n/locales/zh-Hans-x-lzh/common.json
+index 0f92b295..38316e51 100644
+--- a/apps/desktop/src/renderer/i18n/locales/zh-Hans-x-lzh/common.json
++++ b/apps/desktop/src/renderer/i18n/locales/zh-Hans-x-lzh/common.json
+@@ -9377,7 +9377,8 @@
+           "superseded": "已为后呈所代",
+           "legacy_unverified": "旧修订无从核实",
+           "current": "处置之果未确认",
+-          "cancelled": "已罢"
++          "cancelled": "已罢",
++          "failed": "上传未成"
+         },
+         "reason": "处置之由",
+         "rejectionReason": "驳回之由",
+diff --git a/apps/desktop/src/renderer/i18n/locales/zh-Hant-x-lzh/common.json b/apps/desktop/src/renderer/i18n/locales/zh-Hant-x-lzh/common.json
+index e9f6901a..52360ac5 100644
+--- a/apps/desktop/src/renderer/i18n/locales/zh-Hant-x-lzh/common.json
++++ b/apps/desktop/src/renderer/i18n/locales/zh-Hant-x-lzh/common.json
+@@ -9377,7 +9377,8 @@
+           "superseded": "已為後呈所代",
+           "legacy_unverified": "舊修訂無從核實",
+           "current": "處置之果未確認",
+-          "cancelled": "已罷"
++          "cancelled": "已罷",
++          "failed": "上傳未成"
+         },
+         "reason": "處置之由",
+         "rejectionReason": "駁回之由",
+diff --git a/apps/desktop/src/renderer/i18n/locales/zh-TW/common.json b/apps/desktop/src/renderer/i18n/locales/zh-TW/common.json
+index efb29380..51dafc4f 100644
+--- a/apps/desktop/src/renderer/i18n/locales/zh-TW/common.json
++++ b/apps/desktop/src/renderer/i18n/locales/zh-TW/common.json
+@@ -9391,7 +9391,8 @@
+           "superseded": "已由後續提交取代",
+           "legacy_unverified": "歷史修訂無法核實",
+           "current": "處理結果尚未確認",
+-          "cancelled": "已取消"
++          "cancelled": "已取消",
++          "failed": "上傳失敗"
+         },
+         "reason": "處理原因",
+         "rejectionReason": "駁回原因",
